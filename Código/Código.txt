@@ -1,0 +1,376 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+#define BTN_MOVE 2
+#define BTN_SHOOT 3
+#define BTN_PAUSE 4
+
+#define PLAYER_COL 15
+#define ENEMY_COLS 8
+#define ENEMY_ROWS 2
+#define MAX_ENEMY_BULLETS 6
+#define MAX_PLAYER_BULLETS 2
+#define PLAYER_SHOOT_DELAY 1000
+#define ENEMY_LINE_SHOOT_DELAY 1500
+
+byte playerBulletSpeed = 1;
+byte enemyBulletSpeed = 1;
+
+byte playerY = 1;
+byte enemies[ENEMY_ROWS][ENEMY_COLS] = {{1}};
+byte currentLevel = 1;
+unsigned int score = 0;
+
+struct PlayerBullet {
+  byte x;
+  byte y;
+  bool active;
+  unsigned long shootTime;
+};
+PlayerBullet playerBullets[MAX_PLAYER_BULLETS] = {{0, 0, false, 0}};
+
+byte enemyBullets[MAX_ENEMY_BULLETS] = {255};
+unsigned long lastEnemyShotTime = 0;
+bool gameOver = false;
+bool gamePaused = false;
+bool gameStarted = false;
+bool playerShotEffect = false;
+unsigned long playerShotTime = 0;
+unsigned long lastShootTime = 0;
+unsigned long lastEnemyLineShot[ENEMY_ROWS] = {0};
+
+byte playerChar[8] = {
+  B00000, B01110, B01110, B00100,
+  B11111, B10101, B01110, B00000
+};
+
+byte enemyChar[8] = {
+  B00000, B01110, B10101, B11111,
+  B01110, B01010, B10001, B00000
+};
+
+byte enemyBulletChar[8] = {
+  B00000, B00000, B00100, B01110,
+  B11111, B01110, B00100, B00000
+};
+
+byte playerBulletChar[8] = {
+  B00000, B00000, B00000, B01110,
+  B01110, B00000, B00000, B00000
+};
+
+byte explosionChar[8] = {
+  B00000, B01010, B10101, B10001,
+  B10001, B10101, B01010, B00000
+};
+
+void setup() {
+  pinMode(BTN_MOVE, INPUT_PULLUP);
+  pinMode(BTN_SHOOT, INPUT_PULLUP);
+  pinMode(BTN_PAUSE, INPUT_PULLUP);
+
+  lcd.init();
+  lcd.backlight();
+
+  lcd.createChar(0, playerChar);
+  lcd.createChar(1, enemyChar);
+  lcd.createChar(2, enemyBulletChar);
+  lcd.createChar(3, playerBulletChar);
+  lcd.createChar(4, explosionChar);
+
+  resetGame();
+  randomSeed(analogRead(0));
+  
+  showStartScreen();
+}
+
+void showStartScreen() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("SPACE INVADERS");
+  lcd.setCursor(0, 1);
+  lcd.print("Aperte start");
+}
+
+void resetGame() {
+  for (byte row = 0; row < ENEMY_ROWS; row++) {
+    for (byte col = 0; col < ENEMY_COLS; col++) {
+      enemies[row][col] = 1;
+    }
+    lastEnemyLineShot[row] = 0;
+  }
+
+  for (byte i = 0; i < MAX_PLAYER_BULLETS; i++) {
+    playerBullets[i].active = false;
+  }
+  
+  playerShotEffect = false;
+  for (byte i = 0; i < MAX_ENEMY_BULLETS; i++) {
+    enemyBullets[i] = 255;
+  }
+
+  gameOver = false;
+  gamePaused = false;
+  
+  if(currentLevel == 1) {
+    score = 0;
+    playerBulletSpeed = 1;
+    enemyBulletSpeed = 1;
+  }
+  
+  lastEnemyShotTime = millis();
+  lastShootTime = 0;
+}
+
+void nextLevel() {
+  currentLevel++;
+  playerBulletSpeed = min(playerBulletSpeed + 1, 3);
+  enemyBulletSpeed = min(enemyBulletSpeed + 1, 3);
+  
+  unsigned int savedScore = score;
+  resetGame();
+  score = savedScore;
+}
+
+void checkInput() {
+  static unsigned long lastPauseTime = 0;
+  const unsigned long debounceDelay = 50;
+
+  if (digitalRead(BTN_PAUSE) == LOW && (millis() - lastPauseTime) > debounceDelay) {
+    if (!gameStarted) {
+      gameStarted = true;
+    } 
+    else if (gameOver) {
+      currentLevel = 1;
+      gameStarted = true;
+      gameOver = false;
+      resetGame();
+    }
+    else {
+      gamePaused = !gamePaused;
+    }
+    lastPauseTime = millis();
+    return;
+  }
+
+  if (!gameStarted || gamePaused || gameOver) return;
+
+  static bool lastMoveState = HIGH;
+  bool currentMoveState = digitalRead(BTN_MOVE);
+  
+  if (lastMoveState == HIGH && currentMoveState == LOW) {
+    playerY = !playerY;
+  }
+  lastMoveState = currentMoveState;
+
+  if (digitalRead(BTN_SHOOT) == LOW && (millis() - lastShootTime) > PLAYER_SHOOT_DELAY) {
+    for (byte i = 0; i < MAX_PLAYER_BULLETS; i++) {
+      if (!playerBullets[i].active) {
+        playerBullets[i].x = PLAYER_COL - 1;
+        playerBullets[i].y = playerY;
+        playerBullets[i].active = true;
+        playerBullets[i].shootTime = millis();
+        
+        playerShotEffect = true;
+        playerShotTime = millis();
+        lastShootTime = millis();
+        break;
+      }
+    }
+  }
+}
+
+void enemyShoot() {
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastEnemyShotTime < 500) return;
+
+  byte bulletsPerRow[ENEMY_ROWS] = {0};
+  bool occupiedColumns[ENEMY_COLS] = {false};
+  
+  for (byte i = 0; i < MAX_ENEMY_BULLETS; i++) {
+    if (enemyBullets[i] != 255) {
+      byte row = (enemyBullets[i] >> 4) & 0x0F;
+      bulletsPerRow[row]++;
+      
+      byte col = enemyBullets[i] & 0x0F;
+      if (col < ENEMY_COLS) {
+        occupiedColumns[col] = true;
+      }
+    }
+  }
+
+  byte validRows[ENEMY_ROWS];
+  byte validRowCount = 0;
+  
+  for (byte row = 0; row < ENEMY_ROWS; row++) {
+    if (bulletsPerRow[row] < 3 && (currentTime - lastEnemyLineShot[row] >= ENEMY_LINE_SHOOT_DELAY)) {
+      validRows[validRowCount++] = row;
+    }
+  }
+
+  if (validRowCount == 0) return;
+
+  byte row = validRows[random(validRowCount)];
+  
+  byte validCols[ENEMY_COLS];
+  byte validColCount = 0;
+
+  for (byte col = 0; col < ENEMY_COLS; col++) {
+    if (enemies[row][col] && !occupiedColumns[col]) {
+      validCols[validColCount++] = col;
+    }
+  }
+
+  if (validColCount > 0) {
+    byte col = validCols[random(validColCount)];
+    
+    for (byte i = 0; i < MAX_ENEMY_BULLETS; i++) {
+      if (enemyBullets[i] == 255) {
+        enemyBullets[i] = (row << 4) | col;
+        lastEnemyShotTime = currentTime;
+        lastEnemyLineShot[row] = currentTime;
+        break;
+      }
+    }
+  }
+}
+
+void updateGame() {
+  if (!gameStarted || gamePaused || gameOver) return;
+
+  enemyShoot();
+
+  if (playerShotEffect && (millis() - playerShotTime > 200)) {
+    playerShotEffect = false;
+  }
+
+  for (byte i = 0; i < MAX_PLAYER_BULLETS; i++) {
+    if (playerBullets[i].active) {
+      playerBullets[i].x -= playerBulletSpeed;
+
+      if (playerBullets[i].x < ENEMY_COLS) {
+        for (byte row = 0; row < ENEMY_ROWS; row++) {
+          for (byte col = 0; col < ENEMY_COLS; col++) {
+            if (playerBullets[i].x == col && playerBullets[i].y == row && enemies[row][col]) {
+              enemies[row][col] = 0;
+              playerBullets[i].active = false;
+              score += 10;
+
+              lcd.setCursor(col, row);
+              lcd.write(4);
+              delay(100);
+              lcd.setCursor(col, row);
+              lcd.print(" ");
+              break;
+            }
+          }
+        }
+      }
+      
+      if (playerBullets[i].x == 255) {
+        playerBullets[i].active = false;
+      }
+    }
+  }
+
+  bool allDead = true;
+  for (byte r = 0; r < ENEMY_ROWS; r++) {
+    for (byte c = 0; c < ENEMY_COLS; c++) {
+      if (enemies[r][c]) {
+        allDead = false;
+        break;
+      }
+    }
+    if (!allDead) break;
+  }
+
+  if (allDead) {
+    nextLevel();
+    return;
+  }
+
+  for (byte i = 0; i < MAX_ENEMY_BULLETS; i++) {
+    if (enemyBullets[i] != 255) {
+      byte row = (enemyBullets[i] >> 4) & 0x0F;
+      byte col = (enemyBullets[i] & 0x0F) + enemyBulletSpeed;
+
+      if (col >= PLAYER_COL) {
+        if (row == playerY) {
+          gameOver = true;
+        }
+        enemyBullets[i] = 255;
+      } else {
+        enemyBullets[i] = (row << 4) | col;
+      }
+    }
+  }
+}
+
+void drawGame() {
+  lcd.clear();
+
+  if (!gameStarted) {
+    showStartScreen();
+    return;
+  }
+
+  if (gameOver) {
+    lcd.setCursor(0, 0);
+    lcd.print("Acabou o Jogo");
+    lcd.setCursor(0, 1);
+    lcd.print("Nivel:");
+    lcd.print(currentLevel);
+    lcd.print(" Pts:");
+    lcd.print(score);
+    return;
+  }
+
+  if (gamePaused) {
+    lcd.setCursor(0, 0);
+    lcd.print("Pausa");
+    lcd.setCursor(0, 1);
+    lcd.print("Nivel:");
+    lcd.print(currentLevel);
+    lcd.print(" Pts:");
+    lcd.print(score);
+    return;
+  }
+
+  for (byte row = 0; row < ENEMY_ROWS; row++) {
+    for (byte col = 0; col < ENEMY_COLS; col++) {
+      if (enemies[row][col]) {
+        lcd.setCursor(col, row);
+        lcd.write(1);
+      }
+    }
+  }
+
+  for (byte i = 0; i < MAX_PLAYER_BULLETS; i++) {
+    if (playerBullets[i].active) {
+      lcd.setCursor(playerBullets[i].x, playerBullets[i].y);
+      lcd.write(3);
+    }
+  }
+
+  for (byte i = 0; i < MAX_ENEMY_BULLETS; i++) {
+    if (enemyBullets[i] != 255) {
+      byte row = (enemyBullets[i] >> 4) & 0x0F;
+      byte col = enemyBullets[i] & 0x0F;
+      lcd.setCursor(col, row);
+      lcd.write(2);
+    }
+  }
+
+  lcd.setCursor(PLAYER_COL, playerY);
+  lcd.write(0);
+}
+
+void loop() {
+  checkInput();
+  updateGame();
+  drawGame();
+  delay(150);
+}
